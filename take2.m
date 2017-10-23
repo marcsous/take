@@ -1,5 +1,5 @@
-function [ksp keep] = take2(data,mask,varargin)
-% [ksp keep] = take2(data,mask,varargin)
+function [ksp mask] = take2(data,mask,varargin)
+% [ksp mask] = take2(data,mask,varargin)
 %
 % Trimmed autocalibrating k-space estimation based
 % on structured matrix completion for 2d datasets.
@@ -11,7 +11,7 @@ function [ksp keep] = take2(data,mask,varargin)
 %
 % Outputs:
 %  -ksp [nx ny nc]: 2d kspace data from nc coils
-%  -keep [nx ny]: mask of retained kspace samples
+%  -mask [nx ny]: sampling mask with outliers trimmed
 %
 % References:
 %  -Bydder M. Magnetic Resonance Imaging 43:88 (2017)
@@ -120,13 +120,12 @@ end
 
 %% POCS iterations - solve for ksp
 
-keep = mask; % retained samples
 ksp = zeros(nx,ny,nc,'like',data);
 
 for iter = 1:opts.maxit
     
     % data consistency
-    ksp = bsxfun(@times,data,keep)+bsxfun(@times,ksp,~keep);
+    ksp = bsxfun(@times,data,mask)+bsxfun(@times,ksp,~mask);
 
     % make calibration matrix
     A = make_data_matrix(ksp,opts);
@@ -187,11 +186,11 @@ for iter = 1:opts.maxit
     
     % project over kspace dimension
     if opts.proj
-        r(~keep) = 0;
+        r(~mask) = 0;
         r = sum(r,opts.proj);
-        index = find(any(keep,opts.proj));
+        index = find(any(mask,opts.proj));
     else    
-        index = find(keep);
+        index = find(mask);
     end
     r = r(index);
     
@@ -209,9 +208,9 @@ for iter = 1:opts.maxit
             rejected = 0; % reject nothing
         else
             rejected = index(k);
-            if opts.proj==0; keep(rejected) = 0; end % reject worst point
-            if opts.proj==1; keep(:,rejected) = 0; end % reject worst col
-            if opts.proj==2; keep(rejected,:) = 0; end % reject worst row
+            if opts.proj==0; mask(rejected) = 0; end % reject worst point
+            if opts.proj==1; mask(:,rejected) = 0; end % reject worst col
+            if opts.proj==2; mask(rejected,:) = 0; end % reject worst row
         end
 
         % display info
@@ -286,6 +285,10 @@ for iter = 1:opts.maxit
     if converged && ~rejected; break; end
 
 end
+
+% return on CPU
+ksp = gather(ksp);
+mask = gather(ksp);
 
 %% make calibration matrix
 function A = make_data_matrix(data,opts)
