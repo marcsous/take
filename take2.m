@@ -288,7 +288,7 @@ end
 
 % return on CPU
 ksp = gather(ksp);
-mask = gather(ksp);
+mask = gather(mask);
 
 %% make calibration matrix
 function A = make_data_matrix(data,opts)
