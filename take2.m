@@ -17,7 +17,7 @@ function [ksp mask] = take2(data,mask,varargin)
 %  -Bydder M et al. TAKE. Magnetic Resonance Imag 2017;43:88
 %  -Haldar JP et al. LORAKS. IEEE Trans Med Imag 2014;33:668
 %  -Shin PJ et al. SAKE. Magn Resonance Medicine 2014;72:959
-%
+
 %% setup
 
 % default options
@@ -96,7 +96,6 @@ bytes = 2 * prod(opts.dims) * getfield(whos('k'),'bytes');
 density = nnz(mask) / numel(mask);
 
 % display
-t = tic;
 disp(rmfield(opts,{'flip','kernel'}));
 fprintf('Sampling density = %f\n',density);
 fprintf('Matrix = %ix%i (%.1f Mb)\n',nx*ny,prod(opts.dims(3:end)),bytes/1e6);
@@ -105,20 +104,21 @@ fprintf('Matrix = %ix%i (%.1f Mb)\n',nx*ny,prod(opts.dims(3:end)),bytes/1e6);
 
 try
     gpu = gpuDevice;
-    if gpu.AvailableMemory < 4*bytes; error('GPU memory too small.'); end
-    if verLessThan('matlab','8.4'); error('GPU needs MATLAB R2014b.'); end
+    if gpu.AvailableMemory < 4*bytes; error('GPU memory too small'); end
+    if verLessThan('matlab','8.4'); error('GPU needs MATLAB R2014b'); end
     data = gpuArray(data);
     mask = gpuArray(mask);
 catch ME
     data = gather(data);
     mask = gather(mask);
-    warning([ME.message ' Using CPU.'])
+    warning('%s. Using CPU.', ME.message);
 end
 
 %% POCS iterations - solve for ksp
 
 ksp = zeros(nx,ny,nc,'like',data);
 
+t = tic;
 for iter = 1:1000000
 
     % data consistency
@@ -128,7 +128,7 @@ for iter = 1:1000000
     A = make_data_matrix(ksp,opts);
 
     % row space, singular values
-    [V S] = svd(A'*A);
+    [~,S,V] = svd(A'*A);
     S = sqrt(diag(S));
 
     % initialize noise floor
@@ -247,7 +247,7 @@ for iter = 1:1000000
         end
         % show current image
         subplot(1,3,2);
-        ims(sum(abs(ifft2(ksp)),3));
+        imagesc(sum(abs(ifft2(ksp)),3));
         xlabel('dim 2'); ylabel('dim 1'); title(sprintf('iter %i',iter));
         % plot change in norm and tol
         subplot(1,4,4);
