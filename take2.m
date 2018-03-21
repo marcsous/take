@@ -250,7 +250,7 @@ for iter = 1:1000000
         imagesc(sum(abs(ifft2(ksp)),3));
         xlabel('dim 2'); ylabel('dim 1'); title(sprintf('iter %i',iter));
         % plot change in norm and tol
-        subplot(1,4,4);
+        subplot(1,3,3);
         [h,~,~] = plotyy(1:iter,max(tol,opts.tol),1:iter,normA);
         set(h(1),'YScale','log'); set(h(2),'YScale','log');
         title('metrics'); legend({'||Δk||/||k||','||A||_* norm'});
