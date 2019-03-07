@@ -37,7 +37,7 @@ opts.proj = 2; % projection dimension [0 1 2]
 opts.noise = []; % noise std, if available
 opts.center = []; % center of kspace, if available
 opts.errors = []; % known errors (for validation)
-opts.display = 10; % no. iterations to update display
+opts.display = 10; % no. iterations to display plots
 
 % varargin handling (must be option/value pairs)
 for k = 1:2:numel(varargin)
