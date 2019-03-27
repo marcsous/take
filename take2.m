@@ -150,7 +150,7 @@ for iter = 1:opts.maxit
     % make calibration matrix
     A = make_data_matrix(ksp,opts);
     
-    % row space, singular values (A'A=U*W*V')
+    % row space, singular values (A'A=V'W'*W*V)
     [V W] = svd(A'*A);
     W = sqrt(diag(W));
     
