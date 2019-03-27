@@ -3,41 +3,44 @@ function [ksp mask flag] = take2(data,mask,varargin)
 %
 % Trimmed autocalibrating k-space estimation in 2D
 % based on structured low rank matrix completion.
+% Uses a heuristic approaches to remove outliers.
 %
-% Singular value filtering is done based on opts.noise
-% which is a key parameter that affects image quality.
+% Singular value filtering requires noise estimate
+% which is a key parameter. The other key parameter
+% is tolerance (smaller is better but slower).
 %
 % Inputs:
-%  -data [nx ny nc]: 2D kspace data from nc coils
+%  -data [nx ny nc]: kspace data from nc coils
 %  -mask: 1D/2D/3D sampling mask (or 1D indices)
-%  -varargin: option/value pairs (e.g. 'radial',1)
+%  -varargin: option/value pairs (e.g. 'nmad',4)
 %
 % Outputs:
-%  -ksp [nx ny nc]: 2D kspace data from nc coils
-%  -mask [nx ny nc]: sampling mask with outliers trimmed
-%  -flag is 0 for successful termination
+%  -ksp [nx ny nc]: kspace data from nc coils
+%  -mask [nx ny nc]: updated sampling mask
+%  -flag is zero for successful termination
 %
 % References:
-%  -Haldar JP et al. LORAKS. IEEE Trans Med Imag 2014;33:668
 %  -Shin PJ et al. SAKE. Magn Resonance Medicine 2014;72:959
+%  -Haldar JP et al. LORAKS. IEEE Trans Med Imag 2014;33:668
 %  -Bydder M et al. TAKE. Magnetic Resonance Imag 2017;43:88
 
 %% setup
 
 % default options
-opts.width = 6; % kernel width
-opts.radial = 1; % use radial kernel
-opts.loraks = 0; % use phase constraint
-opts.tol = 1e-3; % relative tolerance
-opts.maxit = 10000; % maximum no. iterations
-opts.minit = 5; % min. no. iterations after trim
+opts.width = 5; % kernel width (default 5)
+opts.radial = 0; % use radial kernel (0 or 1)
+opts.loraks = 0; % use phase constraint (0 or 1)
+opts.tol = 5e-4; % relative tolerance (5e-4)
+opts.maxit = 1e4; % maximum no. iterations (1e4)
+opts.minit = 1e1; % minimum no. iterations (1e1)
 opts.irls = 5; % no. irls iterations (0=use mean)
-opts.nmad = 3; % outlier threshold (mad=1.4826*std)
-opts.proj = 2; % projection dimension [0 1 2]
+opts.nmad = 5; % outlier threshold (mad=1.4826*std)
+opts.proj = 2; % projection dimension (0, 1 or 2)
 opts.noise = []; % noise std, if available
 opts.center = []; % center of kspace, if available
 opts.errors = []; % known errors (for validation)
-opts.display = 10; % no. iterations to display plots
+opts.display = 20; % no. iterations between plots
+opts.power = 0.5; % density weighting power (0=off)
 
 % varargin handling (must be option/value pairs)
 for k = 1:2:numel(varargin)
@@ -95,8 +98,7 @@ opts.kernel.y = y(k);
 opts.kernel.mask = k;
 
 % dimensions of the matrix
-opts.dims = [nx ny nc nk 1];
-if opts.loraks; opts.dims(5) = 2; end
+opts.dims = [nx ny nc nk 1+opts.loraks];
 
 % estimate center of kspace
 if isempty(opts.center)
@@ -131,7 +133,12 @@ catch ME
     warning('%s Using CPU.', ME.message);
 end
 
-%% Cadzow algorithm
+%% Cadzow algorithm - solve for ksp
+
+t = tic;
+old = NaN;
+converged = 0;
+noise_floor = -1;
 
 ksp = zeros(size(data),'like',data);
 
@@ -143,134 +150,125 @@ for iter = 1:opts.maxit
     % make calibration matrix
     A = make_data_matrix(ksp,opts);
     
-    % row space, singular values
+    % row space, singular values (A'A=U*W*V')
     [V W] = svd(A'*A);
     W = sqrt(diag(W));
     
-    % estimate noise floor from singular values (ad hoc)
+    % estimate noise floor of singular values (heuristic)
     if ~isempty(opts.noise)
-        sigma = opts.noise * sqrt(matrix_density*nx*ny);
-    elseif ~exist('sigma','var')
+        noise_floor = opts.noise * sqrt(matrix_density*nx*ny);
+    elseif noise_floor==-1
         for j = 1:numel(W)
             h = hist(W(j:end));
             [~,k] = max(h);
             if k>1; break; end
         end
-        sigma = median(W(j:end)); % center of Marcenko-Pastur distribution?
+        noise_floor = median(W(j:end)); % center of Marcenko-Pastur distribution?
     end
-    noise_est = sigma / sqrt(matrix_density*nx*ny); % noise estimated from sigma
+    noise_std = noise_floor / sqrt(matrix_density*nx*ny); % noise std estimate
 
-    % minimum variance filtering
-    f = max(0,1-sigma.^2./W.^2); 
+    % minimum variance filter (De Moor B. IEEE Trans Sig Proc 1993;41:2826)
+    f = max(0,1-noise_floor.^2./W.^2); 
     F = V * diag(f) * V';
     A = A * F;
 
     % undo Hankel stucture
     A = undo_data_matrix(A,opts);
     
-    % A should be rank nc - combine redundant copies
+    % A should be rank nc, combine redundant copies
     A = reshape(A,nx,ny,nc,[]);
-
     if opts.irls==0
         ksp = mean(A,4);
     else
         for j = 1:opts.irls
             w = abs(bsxfun(@minus,A,ksp));
-            w = 1./max(w,noise_est*1e-7);
+            w = 1./max(w,noise_std*1e-7);
             ksp = sum(w.*A,4)./sum(w,4);
         end
     end
 
-    % convergence (increment until it reaches opts.minit)
-    if iter==1
-        t = tic;
-        converged = 0;
-        tol(iter) = opts.tol;
-    else
-        tmp = norm(ksp(:)-old(:)) / norm(ksp(:));
-        tol(iter) = gather(tmp);
-        converged = converged + (tol(iter) < opts.tol);
-    end
-    old = ksp;
+    % check convergence: min(normA) not adequate so use tol
     normA(iter) = sum(W);
+    tol(iter) = norm(ksp(:)-old(:)) / norm(ksp(:));
+    converged = converged + (tol(iter) < opts.tol);
+    old = ksp;
     
-    % residual
+    % residual... or possibly abs(abs(data)-abs(ksp))?
     r = abs(data-ksp);
  
-    % project over coil dimension and center
-    r = median(r,3);
-    r = r - median(r(mask));
+    % project over coil dimension
+    r = sum(r,3);
 
-    % scale by sample density (to avoid trimming consecutive lines)
-    r = r .* sample_density;
-    
-    % project over kspace dimension, center and normalize
-    r(~mask) = NaN;
+    % heuristic to inhibit rejection of too many neigboring lines
+    r = (r-median(r(mask))) .* power(sample_density,opts.power);
+
+    % project over kspace dimension
     if opts.proj
-        r = median(r,opts.proj,'omitnan');
-        r = r - median(r,'omitnan');
-        mad = median(abs(r),'omitnan');
-    else
-        r = r - median(r(:),'omitnan');
-        mad = median(abs(r(:)),'omitnan');
+        r = sum(r,opts.proj);
     end
+
+    % center and normalize
+    r = reshape(r,[],1);
+    [k,~,v] = find(r);
+    r(k) = r(k) - median(v);
+    mad = median(abs(r(k)));
     r = r / mad;
-    
+
     % find the worst data
-    [nmad flag] = max(r(:));
-    
+    [nmad reject] = max(r);
+
     % trim the worst data
-    if converged>=opts.minit
+    if converged==opts.minit
         
         if nmad < opts.nmad
-            flag = 0; % trim nothing
+            reject = 0; % trim nothing
         else
-            if opts.proj==0; [x y] = ind2sub([nx ny],flag); end % point
-            if opts.proj==1; y = flag; x = ':'; end % col
-            if opts.proj==2; x = flag; y = ':'; end % row
-            mask(x,y,:) = 0; % trim point/col/row
+            if opts.proj==0; [x y] = ind2sub([nx ny],reject); end % point
+            if opts.proj==1; y = reject; x = ':'; end % col
+            if opts.proj==2; x = reject; y = ':'; end % row
+            mask(x,y) = 0; % trim point/col/row
             
             % catastrophic failure (center of kspace gone!)
             idx = mod(opts.center(1)+opts.kernel.x-1,nx)+1;
             idy = mod(opts.center(2)+opts.kernel.y-1,ny)+1;
-            if nnz(mask(idx,idy))==0; flag = -1; end
+            if nnz(mask(idx,idy))==0; reject = -1; end
         end
         
         % display trim info
         if ~exist('ntrim','var')
-            ntrim = 0; % no. trimmed points/cols/rows
-            disp('-------------------------------------------------------------------');
-            disp('Count  ||A||  Tolerance  Iter Trimmed nmad    mad      Noise   Time');
-            disp('-------------------------------------------------------------------');
+            ntrim = 1; % counter for no. trimmed points/cols/rows
+            disp('----------------------------------------------------------');
+            disp('Count  ||A||   Iter  Trimmed nmad    mad      Noise   Time');
+            disp('----------------------------------------------------------');
         end
-        ntrim = ntrim+1;
-        fprintf('%3i %9.2e %8.1e %5i',ntrim,normA(iter),tol(iter),iter);
+        fprintf('%3i %9.2e %5i',ntrim,normA(iter),iter);
         if isempty(opts.errors)
-            fprintf(' %6i  ',flag);
+            fprintf(' %6i  ',reject);
         else
-            fprintf('%6i(%1i)',flag,ismember(flag,opts.errors));
+            fprintf('%6i(%1i)',reject,ismember(reject,opts.errors));
         end
-        fprintf('%5.1f %9.2e %9.2e %4.0f\n',min(nmad,99.9),mad,noise_est,toc(t));
+        fprintf('%5.1f %9.2e %9.2e %4.0f\n',min(nmad,99.9),mad,noise_std,toc(t));
 
         % update parameters if we trimmed something
-        if flag>0
+        if reject>0
+            ntrim = ntrim+1; % increment counter
             matrix_density = nnz(mask) / numel(mask);
             sample_density = calc_sample_density(mask,opts);
-            clear sigma; % trigger recalculation
-            converged = 0; % reset minit counter
+            converged = 0; % reset minit counter            
+            noise_floor = -1; % trigger recalculation
         end
         
     end
     
     % display plots
-    if mod(iter,opts.display)==1 || converged>=opts.minit
+    if mod(iter,opts.display)==1 || converged==opts.minit
         % singular values
         subplot(2,4,[1 5]); plot(W/W(1)); hold on; plot(f,'--'); hold off
         xlim([0 numel(f)+1]); title(sprintf('rank %i/%i',nnz(f),numel(f)));
         line(xlim,[0 0]+gather(W(nnz(f))/W(1)),'linestyle',':','color','black');
         legend({'singular vals.','sing. val. filter','noise floor'});
         % residual norm plot
-        subplot(2,4,2); k = find(~isnan(r(:))); plot(k,r(k)); ylabel('r / mad');
+        subplot(2,4,2); [k,~,v] = find(r); plot(k,v); ylabel('r / mad');
         if opts.proj==0; xlim([0 nx*ny+1]); xlabel('dims'); end
         if opts.proj==1; xlim([0 ny+1]); xlabel('dim 2'); end
         if opts.proj==2; xlim([0 nx+1]); xlabel('dim 1'); end
@@ -287,12 +285,12 @@ for iter = 1:opts.maxit
         imagesc(tmp); xlabel('dim 2'); ylabel('dim 1'); title(sprintf('iter %i',iter));
         % change in norm and tol
         subplot(2,4,[4 8]); g = plotyy(1:iter,tol,1:iter,normA,'semilogy','semilogy');
-        title('metrics'); axis(g,'tight'); xlim(g,[0 iter+1]);
-        legend({'||Δk||/||k||','||A||_* norm'}); xlabel('iters'); drawnow;
+        xlim(g,[0 iter+1]); xlabel('iters');
+        title('metrics'); legend({'||Δk||_F','||A||_*'}); drawnow;
     end
     
     % finish when nothing left to do
-    if converged>=opts.minit && flag<=0
+    if converged==opts.minit && reject<=0
         % show original image
         subplot(2,4,[4 8]); tmp = sum(abs(ifft2(data)),3);
         if tmp(1,1)>tmp(fix(nx/2),fix(ny/2)); tmp = fftshift(tmp); end
@@ -305,8 +303,9 @@ end
 % return on CPU
 ksp = gather(ksp);
 mask = gather(mask);
+flag = reject;
 
-%% sample density in kspace (approximate)
+%% approximate sample density in kspace
 function d = calc_sample_density(mask,opts);
 kernel = fftn(opts.kernel.mask,opts.dims(1:2));
 d = ifftn(bsxfun(@times,fftn(mask),kernel),'symmetric');
