@@ -12,4 +12,4 @@ figure; take2(data,'std',0.08,'errors',added_errors);
 %load head1 % fully sampled
 %load head2 % fully sampled
 load head3 % fully sampled
-figure; take2(data);
+figure; take2(data,'nstd',3);
