@@ -110,10 +110,14 @@ try
     if verLessThan('matlab','8.4'); error('GPU needs MATLAB R2014b.'); end
     mask = gpuArray(mask);
     data = gpuArray(data);
+    opts.flip.x = gpuArray(opts.flip.x);
+    opts.flip.y = gpuArray(opts.flip.y);
     fprintf('GPU found: %s (%.1f Gb)\n',gpu.Name,gpu.AvailableMemory/1e9);
 catch ME
     mask = gather(mask);
     data = gather(data);
+    opts.flip.x = gather(opts.flip.x);
+    opts.flip.y = gather(opts.flip.y);
     warning('%s Using CPU.', ME.message);
 end
 
@@ -149,9 +153,9 @@ for iter = 1:opts.maxit
         ksp = sum(w.*A,4) ./ sum(w,4);
     end
 
-    % convergence metrics: nuclear norm and delta ksp
-    nrm(1,iter) = sum(W);
-    nrm(2,iter) = norm(ksp(:)-old(:)) / norm(ksp(:));
+    % convergence metrics
+    nrm(1,iter) = sum(W); % nuclear norm
+    nrm(2,iter) = norm(ksp(:)-old(:)) / norm(ksp(:)); % delta ksp
     converged = nrm(2,iter)<opts.tol && (iter-t(end))>=opts.minit;
     
     % residual: abs(data-ksp) is too(?) sensitive to phase errors
