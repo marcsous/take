@@ -29,15 +29,15 @@ function [ksp mask flag] = take2(data,varargin)
 opts.width = 4; % kernel width (default 4)
 opts.radial = 1; % use radial kernel (0 or 1)
 opts.loraks = 1; % use phase constraint (0 or 1)
-opts.tol = 1e-4; % relative tolerance (1e-4)
+opts.tol = 1e-5; % relative tolerance (1e-4)
 opts.maxit = 1e4; % maximum no. iterations (1e4)
 opts.minit = 10; % minimum no. iterations (10)
 opts.irls = 3; % no. irls iterations (0=mean)
 opts.nstd = 4; % outlier threshold (no. std devs)
 opts.readout = 2; % readout dimension (0, 1 or 2)
 opts.std = []; % noise std dev, if available
-opts.errors = []; % known errors (for validation)
 opts.power = 0.5; % density weighting power (0=off)
+opts.errors = []; % known errors (for validation)
 
 % varargin handling (must be option/value pairs)
 for k = 1:2:numel(varargin)
@@ -66,7 +66,7 @@ end
 % convolution kernel indicies
 [x y] = ndgrid(-fix(opts.width/2):fix(opts.width/2));
 if opts.radial
-    k = sqrt(x.^2+y.^2)<=opts.width/2;
+    k = hypot(x,y)<=opts.width/2;
 else
     k = abs(x)<=opts.width/2 & abs(y)<=opts.width/2;
 end
@@ -124,16 +124,16 @@ end
 %% Cadzow algorithm - solve for ksp
 
 ksp = data; 
+mask = any(data,3);
 
 for iter = 1:opts.maxit
     
-    % data consistency
-    old = ksp; % old ksp to check convergence
+    old = ksp; % for convergence testing
     ksp = ksp + bsxfun(@times,data-ksp,mask);
     
-    % make calibration matrix
+    % calibration matrix
     A = make_data_matrix(ksp,opts);
-    
+
     % row space, singular values (A'A=V'W'*W*V)
     [V W] = svd(A'*A);
     W = sqrt(diag(W));
@@ -142,10 +142,10 @@ for iter = 1:opts.maxit
     f = max(0,1-noise_floor.^2./W.^2); 
     A = A * (V * diag(f) * V');
 
-    % undo Hankel stucture
+    % undo hankel structure
     A = undo_data_matrix(A,opts);
 
-    % combine redundant copies (mean or huber)
+    % combine redundant copies (mean or irls)
     ksp = mean(A,4);
     for j = 1:opts.irls
         w = abs(bsxfun(@minus,A,ksp));
@@ -154,10 +154,15 @@ for iter = 1:opts.maxit
     end
 
     % convergence metrics
-    nrm(1,iter) = sum(W); % nuclear norm
-    nrm(2,iter) = norm(ksp(:)-old(:)) / norm(ksp(:)); % delta ksp
-    converged = nrm(2,iter)<opts.tol && (iter-t(end))>=opts.minit;
-    
+    norms(1,iter) = norm(W,1); % nuclear norm
+    if iter==1
+        norms(2,iter) = opts.tol;
+        converged = false;
+    else
+        norms(2,iter) = norm(ksp(:)-old(:));
+        converged = norms(2,iter) < opts.tol && (iter-t(end)) >= opts.minit;
+    end
+
     % residual: abs(data-ksp) is too(?) sensitive to phase errors
     r = abs(abs(ksp)-abs(data));
 
@@ -200,20 +205,20 @@ for iter = 1:opts.maxit
         end
     end
 
-    % display progress - update every second or so
+    % display progress - update every 2 seconds
     if iter==1
         t(1) = tic; % global timer
         t(2) = t(1); % display timer
         t(3) = 0; % iter at each restart
-    elseif converged || toc(t(2)) > 1.5
+    elseif converged || toc(t(2)) > 2
         if t(1)==t(2)
             fprintf('Iterations per second: %.1f\n',(iter-1)/toc(t(1)));
             disp('-----------------------------------------------------');
-            disp('Count  ||A||   Iter  Trimmed   rstd    noise.fl  Time');
+            disp('Count  ||A||   Iter  Trimmed   rstd     noise    Time');
             disp('-----------------------------------------------------');
         end
         if converged && reject~=0
-           fprintf('%3i %9.2e %5i',numel(t)-3,nrm(1,iter),iter);
+           fprintf('%3i %9.2e %5i',numel(t)-3,norms(1,iter),iter);
             if isempty(opts.errors)
                 fprintf(' %6i  ',reject);
             else
@@ -221,7 +226,7 @@ for iter = 1:opts.maxit
             end
             fprintf('%9.2e %9.2e %5.0f\n',rstd,noise_floor,toc(t(1)));
         end
-        display(W,f,r,ksp,data,iter,nrm,mask,opts); t(2) = tic;
+        display(W,f,r,ksp,data,iter,norms,mask,opts); t(2) = tic;
     end
 
     % finish
@@ -256,13 +261,19 @@ ny = size(data,2);
 nc = size(data,3);
 nk = opts.dims(4);
 
-A = zeros(nx,ny,nc,nk,'like',data);
-
-for k = 1:nk
-    x = opts.kernel.x(k);
-    y = opts.kernel.y(k);
-    A(:,:,:,k) = circshift(data,[x y]);
+% precompute the circshifts with fast indexing
+persistent ix
+if isempty(ix)
+    ix = reshape(1:uint32(numel(data)),size(data));
+    ix = repmat(ix,[1 1 1 nk]);
+    for k = 1:nk
+        x = opts.kernel.x(k);
+        y = opts.kernel.y(k);
+        ix(:,:,:,k) = circshift(ix(:,:,:,k),[x y]);
+    end
+    if isa(data,'gpuArray'); ix = gpuArray(ix); end
 end
+A = data(ix);
 
 if opts.loraks
     A = cat(5,A,conj(A(opts.flip.x,opts.flip.y,:,:)));
@@ -284,16 +295,23 @@ if opts.loraks
     A(opts.flip.x,opts.flip.y,:,:,2) = conj(A(:,:,:,:,2));
 end
 
-for k = 1:nk
-    x = opts.kernel.x(k);
-    y = opts.kernel.y(k);
-    A(:,:,:,k,:) = circshift(A(:,:,:,k,:),-[x y]);
+% precompute the circshifts with fast indexing
+persistent xi
+if isempty(xi)
+    xi = reshape(1:uint32(numel(A)),size(A));
+    for k = 1:nk
+        x = opts.kernel.x(k);
+        y = opts.kernel.y(k);
+        xi(:,:,:,k,:) = circshift(xi(:,:,:,k,:),-[x y]);
+    end
+    if isa(A,'gpuArray'); xi = gpuArray(xi); end
 end
+A = A(xi);
 
 A = reshape(A,nx,ny,nc,[]);
 
 %% show plots of various things (slow)
-function display(W,f,r,ksp,data,iter,nrm,mask,opts)
+function display(W,f,r,ksp,data,iter,norms,mask,opts)
 [nx ny nc] = size(ksp);
 % prefer ims over imagesc
 if exist('ims','file'); imagesc = @(x)ims(x,-0.99); end
@@ -316,9 +334,9 @@ if opts.readout<=1; xlabel('dim 2'); ylabel('dim 1'); end
 if opts.readout==2; xlabel('dim 1'); ylabel('dim 2'); end
 % current image
 subplot(2,4,[3 7]); tmp = sum(abs(ifft2(ksp)),3);
-if max(tmp(:,1))>max(tmp(:,floor(ny/2+1))); tmp = fftshift(tmp); end;
+if sum(tmp(:,1))>sum(tmp(:,floor(ny/2)+1)); tmp = fftshift(tmp); end
 imagesc(tmp); xlabel('dim 2'); ylabel('dim 1'); title(sprintf('iter %i',iter));
 % change in norms
-subplot(2,4,[4 8]); g = plotyy(1:iter,nrm(2,:),1:iter,nrm(1,:),'semilogy','semilogy');
+subplot(2,4,[4 8]); g = plotyy(1:iter,norms(2,:),1:iter,norms(1,:),'semilogy','semilogy');
 xlim(g,[0 iter]); xlabel('iters'); title('metrics'); legend({'||Δk||','||A||_*'});
 drawnow;
