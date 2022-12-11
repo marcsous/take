@@ -5,10 +5,10 @@ function [ksp mask flag] = take2(data,varargin)
 % based on structured low rank matrix completion.
 % Uses an heuristic approach to remove outliers.
 %
-% Singular value filtering requires the noise std
-% which is a key parameter. Other key parameters
-% are tolerance (smaller is better/slower) and no.
-% stds to define the outlier threshold.
+% Performance depends on the noise std which should
+% ideally be provided. Other key parameters are
+% tolerance (smaller is better/slower) and no. stds
+% to define the outlier threshold.
 %
 % Inputs:
 %  -data [nx ny nc]: kspace data from nc coils
@@ -29,7 +29,7 @@ function [ksp mask flag] = take2(data,varargin)
 opts.width = 4; % kernel width (default 4)
 opts.radial = 1; % use radial kernel (0 or 1)
 opts.loraks = 1; % use phase constraint (0 or 1)
-opts.tol = 1e-5; % relative tolerance (1e-4)
+opts.tol = 1e-4; % relative tolerance (1e-4)
 opts.maxit = 1e4; % maximum no. iterations (1e4)
 opts.minit = 10; % minimum no. iterations (10)
 opts.irls = 3; % no. irls iterations (0=mean)
@@ -91,14 +91,14 @@ opts.dims = [nx ny nc nk 1+opts.loraks];
 % sampling mask (same for all coils)
 mask = any(data,3);
 
-% estimate noise std (heuristic)
-std_estimated = isempty(opts.std);
-if std_estimated; opts.std = estimate_std(data,mask); end
-noise_floor = opts.std * sqrt(nnz(mask));
-
 % density
 matrix_density = nnz(mask) / numel(mask);
 sample_density = calc_sample_density(mask,opts);
+
+% estimate noise std
+std_estimated = isempty(opts.std);
+if std_estimated; opts.std = estimate_std(data,mask); end
+noise_floor = opts.std * sqrt(nnz(mask));
 
 % display
 disp(rmfield(opts,{'flip','kernel'}));
@@ -124,15 +124,14 @@ end
 %% Cadzow algorithm - solve for ksp
 
 ksp = data; 
-mask = any(data,3);
 
 for iter = 1:opts.maxit
     
-    old = ksp; % for convergence testing
+    % data consistency
     ksp = ksp + bsxfun(@times,data-ksp,mask);
     
     % calibration matrix
-    A = make_data_matrix(ksp,opts);
+    [A opts] = make_data_matrix(ksp,opts);
 
     % row space, singular values (A'A=V'W'*W*V)
     [V W] = svd(A'*A);
@@ -143,7 +142,7 @@ for iter = 1:opts.maxit
     A = A * (V * diag(f) * V');
 
     % undo hankel structure
-    A = undo_data_matrix(A,opts);
+    [A opts] = undo_data_matrix(A,opts);
 
     % combine redundant copies (mean or irls)
     ksp = mean(A,4);
@@ -159,10 +158,11 @@ for iter = 1:opts.maxit
         norms(2,iter) = opts.tol;
         converged = false;
     else
-        norms(2,iter) = norm(ksp(:)-old(:));
+        norms(2,iter) = gather(norm(ksp(:)-old(:)) / norm(ksp(:))); 
         converged = norms(2,iter) < opts.tol && (iter-t(end)) >= opts.minit;
     end
-
+    old = ksp; % for convergence testing
+    
     % residual: abs(data-ksp) is too(?) sensitive to phase errors
     r = abs(abs(ksp)-abs(data));
 
@@ -205,30 +205,30 @@ for iter = 1:opts.maxit
         end
     end
 
-    % display progress - update every 2 seconds
+    % display progress - update every second
     if iter==1
-        t(1) = tic; % global timer
-        t(2) = t(1); % display timer
-        t(3) = 0; % iter at each restart
-    elseif converged || toc(t(2)) > 2
+        t(1:2) = tic; t(3) = 0; % timers and counter
+    elseif toc(t(2)) > 1 || converged
         if t(1)==t(2)
-            fprintf('Iterations per second: %.1f\n',(iter-1)/toc(t(1)));
+            fprintf('Iterations per second: %.2f\n',(iter-1) / toc(t(1)));
             disp('-----------------------------------------------------');
             disp('Count  ||A||   Iter  Trimmed   rstd     noise    Time');
             disp('-----------------------------------------------------');
+            display(W,f,r,ksp,data,iter,norms,mask,opts); t(2) = tic;
         end
         if converged && reject~=0
-           fprintf('%3i %9.2e %5i',numel(t)-3,norms(1,iter),iter);
+            fprintf('%3i %9.2e %5i',numel(t)-3,norms(1,iter),iter);
             if isempty(opts.errors)
                 fprintf(' %6i  ',reject);
             else
                 fprintf('%6i(%1i)',reject,ismember(reject,opts.errors));
             end
             fprintf('%9.2e %9.2e %5.0f\n',rstd,noise_floor,toc(t(1)));
+        else
+            display(W,f,r,ksp,data,iter,norms,mask,opts); t(2) = tic;
         end
-        display(W,f,r,ksp,data,iter,norms,mask,opts); t(2) = tic;
     end
-
+    
     % finish
     if converged && reject==0; break; end
 
@@ -239,14 +239,14 @@ ksp = gather(ksp);
 mask = gather(mask);
 flag = reject;
 
-%% approximate sample density in kspace
+%% sample density in kspace (approximate)
 function d = calc_sample_density(mask,opts);
 kernel = fftn(opts.kernel.mask,opts.dims(1:2));
 d = ifftn(bsxfun(@times,fftn(mask),kernel),'symmetric');
 d = circshift(d,-floor(size(opts.kernel.mask)/2));
 d = max(d.*mask,0)/nnz(opts.kernel.mask);
 
-%% estimate noise std from data
+%% estimate noise std from data (heuristic)
 function noise_std = estimate_std(data,mask)
 tmp = bsxfun(@times,data,mask); tmp = nonzeros(tmp);
 tmp = sort([real(tmp); imag(tmp)]); % separate real/imag for median
@@ -254,7 +254,7 @@ k = ceil(numel(tmp)/10); tmp = tmp(k:end-k+1); % trim 10% off both ends
 noise_std = 1.4826 * median(abs(tmp-median(tmp))) * sqrt(2); % robust std
 
 %% make calibration matrix
-function A = make_data_matrix(data,opts)
+function [A opts] = make_data_matrix(data,opts)
 
 nx = size(data,1);
 ny = size(data,2);
@@ -262,18 +262,17 @@ nc = size(data,3);
 nk = opts.dims(4);
 
 % precompute the circshifts with fast indexing
-persistent ix
-if isempty(ix)
-    ix = reshape(1:uint32(numel(data)),size(data));
-    ix = repmat(ix,[1 1 1 nk]);
+if ~isfield(opts,'ix')
+    opts.ix = repmat(1:uint32(nx*ny*nc),[1 nk]);
+    opts.ix = reshape(opts.ix,nx,ny,nc,nk);
     for k = 1:nk
         x = opts.kernel.x(k);
         y = opts.kernel.y(k);
-        ix(:,:,:,k) = circshift(ix(:,:,:,k),[x y]);
+        opts.ix(:,:,:,k) = circshift(opts.ix(:,:,:,k),[x y]);
     end
-    if isa(data,'gpuArray'); ix = gpuArray(ix); end
+    if isa(data,'gpuArray'); opts.ix = gpuArray(opts.ix); end
 end
-A = data(ix);
+A = data(opts.ix);
 
 if opts.loraks
     A = cat(5,A,conj(A(opts.flip.x,opts.flip.y,:,:)));
@@ -282,7 +281,7 @@ end
 A = reshape(A,nx*ny,[]);
 
 %% undo calibration matrix
-function A = undo_data_matrix(A,opts)
+function [A opts] = undo_data_matrix(A,opts)
 
 nx = opts.dims(1);
 ny = opts.dims(2);
@@ -296,17 +295,16 @@ if opts.loraks
 end
 
 % precompute the circshifts with fast indexing
-persistent xi
-if isempty(xi)
-    xi = reshape(1:uint32(numel(A)),size(A));
+if ~isfield(opts,'xi')
+    opts.xi = reshape(1:uint32(numel(A)),size(A));
     for k = 1:nk
         x = opts.kernel.x(k);
         y = opts.kernel.y(k);
-        xi(:,:,:,k,:) = circshift(xi(:,:,:,k,:),-[x y]);
+        opts.xi(:,:,:,k,:) = circshift(opts.xi(:,:,:,k,:),-[x y]);
     end
-    if isa(A,'gpuArray'); xi = gpuArray(xi); end
+    if isa(A,'gpuArray'); opts.xi = gpuArray(opts.xi); end
 end
-A = A(xi);
+A = A(opts.xi);
 
 A = reshape(A,nx,ny,nc,[]);
 
@@ -334,7 +332,7 @@ if opts.readout<=1; xlabel('dim 2'); ylabel('dim 1'); end
 if opts.readout==2; xlabel('dim 1'); ylabel('dim 2'); end
 % current image
 subplot(2,4,[3 7]); tmp = sum(abs(ifft2(ksp)),3);
-if sum(tmp(:,1))>sum(tmp(:,floor(ny/2)+1)); tmp = fftshift(tmp); end
+if max(tmp(:,1))>max(tmp(:,floor(ny/2)+1)); tmp = fftshift(tmp); end
 imagesc(tmp); xlabel('dim 2'); ylabel('dim 1'); title(sprintf('iter %i',iter));
 % change in norms
 subplot(2,4,[4 8]); g = plotyy(1:iter,norms(2,:),1:iter,norms(1,:),'semilogy','semilogy');
