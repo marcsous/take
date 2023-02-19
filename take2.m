@@ -36,7 +36,7 @@ opts.irls = 3; % no. irls iterations (0=mean)
 opts.nstd = 4; % outlier threshold (no. std devs)
 opts.readout = 2; % readout dimension (0, 1 or 2)
 opts.std = []; % noise std dev, if available
-opts.power = 0.5; % density weighting power (0=off)
+opts.power = 0; % density weighting power (0=off)
 opts.errors = []; % known errors (for validation)
 
 % varargin handling (must be option/value pairs)
