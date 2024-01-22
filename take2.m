@@ -29,9 +29,9 @@ function [ksp mask flag] = take2(data,varargin)
 opts.width = 4; % kernel width (default 4)
 opts.radial = 1; % use radial kernel (0 or 1)
 opts.loraks = 1; % use phase constraint (0 or 1)
-opts.tol = 1e-4; % relative tolerance (1e-4)
+opts.tol = 1e-5; % relative tolerance (1e-5)
 opts.maxit = 1e4; % maximum no. iterations (1e4)
-opts.minit = 10; % minimum no. iterations (10)
+opts.p = 2; % singular filter shape (>=1) 
 opts.irls = 3; % no. irls iterations (0=mean)
 opts.nstd = 4; % outlier threshold (no. std devs)
 opts.readout = 2; % readout dimension (0, 1 or 2)
@@ -124,21 +124,25 @@ end
 %% Cadzow algorithm - solve for ksp
 
 ksp = data; 
+   
+count = 0; % total number of rejections
+restart = 0; % iteration no. of last rejection
+t(1:2) = tic; % timers (1)=global (2)=display
 
 for iter = 1:opts.maxit
     
     % data consistency
     ksp = ksp + bsxfun(@times,data-ksp,mask);
     
-    % calibration matrix
+    % make calibration matrix
     [A opts] = make_data_matrix(ksp,opts);
 
-    % row space, singular values (A'A=V'W'*W*V)
-    [V W] = svd(A'*A);
-    W = sqrt(diag(W));
+    % row space, singular values (A'A=V'S'*S*V)
+    [V S] = svd(A'*A);
+    S = sqrt(diag(S));
     
-    % minimum variance filter (De Moor B. IEEE Trans Sig Proc 1993;41:2826)
-    f = max(0,1-noise_floor.^2./W.^2); 
+    % singular value filter
+    f = max(0,1-noise_floor.^opts.p./S.^opts.p); 
     A = A * (V * diag(f) * V');
 
     % undo hankel structure
@@ -153,16 +157,13 @@ for iter = 1:opts.maxit
     end
 
     % convergence metrics
-    norms(1,iter) = norm(W,1); % nuclear norm
-    if iter==1
-        norms(2,iter) = opts.tol;
-        converged = false;
+    snorm(iter) = norm(S,opts.p);
+    if iter-restart<10 || snorm(iter)<snorm(iter-1)
+        tol = NaN;
     else
-        norms(2,iter) = gather(norm(ksp(:)-old(:)) / norm(ksp(:))); 
-        converged = norms(2,iter) < opts.tol && (iter-t(end)) >= opts.minit;
+        tol = (snorm(iter)-snorm(iter-1)) / snorm(iter);
     end
-    old = ksp; % for convergence testing
-    
+
     % residual: abs(data-ksp) is too(?) sensitive to phase errors
     r = abs(abs(ksp)-abs(data));
 
@@ -182,55 +183,51 @@ for iter = 1:opts.maxit
     rstd = 1.4826 * median(abs(r(k)));
     r = r / rstd;
 
-    % trim the worst data  
-    if converged
-
+    % trim after convergence 
+    if tol<opts.tol
+        
         % find the worst data
         [nstd reject] = max(r);
-
+        
         if nstd < opts.nstd
             reject = 0; % trim nothing
         else
             if opts.readout==2; x = reject; y = ':'; end % row
             if opts.readout==1; y = reject; x = ':'; end % col
             if opts.readout==0; [x y] = ind2sub([nx ny],reject); end % point
-
+            
             % update parameters
-            mask(x,y) = 0;            
-            t(end+1) = iter;
+            mask(x,y) = 0; r(reject) = 0;
+            restart = iter; count = count+1;             
             matrix_density = nnz(mask) / numel(mask);
             sample_density = calc_sample_density(mask,opts);
             if std_estimated; opts.std = estimate_std(data,mask); end
-            noise_floor = opts.std * sqrt(nnz(mask)); r(reject) = 0;
-        end
-    end
-
-    % display progress - update every second
-    if iter==1
-        t(1:2) = tic; t(3) = 0; % timers and counter
-    elseif toc(t(2)) > 1 || converged
-        if t(1)==t(2)
-            fprintf('Iterations per second: %.2f\n',(iter-1) / toc(t(1)));
-            disp('-----------------------------------------------------');
-            disp('Count  ||A||   Iter  Trimmed   rstd     noise    Time');
-            disp('-----------------------------------------------------');
-            display(W,f,r,ksp,data,iter,norms,mask,opts); t(2) = tic;
-        end
-        if converged && reject~=0
-            fprintf('%3i %9.2e %5i',numel(t)-3,norms(1,iter),iter);
+            noise_floor = opts.std * sqrt(nnz(mask));
+            
+            % display progress
+            if count==1
+                fprintf('Iterations per second: %.2f\n',(iter-1) / toc(t(1)));
+                disp('-----------------------------------------------------');
+                disp('Count  ||A||   Iter  Trimmed   rstd     noise    Time');
+                disp('-----------------------------------------------------');
+            end
+            fprintf('%3i %9.2e %5i',count,snorm(iter),iter);
             if isempty(opts.errors)
                 fprintf(' %6i  ',reject);
             else
                 fprintf('%6i(%1i)',reject,ismember(reject,opts.errors));
             end
             fprintf('%9.2e %9.2e %5.0f\n',rstd,noise_floor,toc(t(1)));
-        else
-            display(W,f,r,ksp,data,iter,norms,mask,opts); t(2) = tic;
         end
+        
+    elseif iter==1 || toc(t(2)) > 1 % update every second
+        
+        display(S,f,r,ksp,data,iter,snorm,tol,mask,opts); t(2) = tic;
+        
     end
     
     % finish
-    if converged && reject==0; break; end
+    if tol<opts.tol && reject==0; break; end
 
 end
 
@@ -250,7 +247,7 @@ d = max(d.*mask,0)/nnz(opts.kernel.mask);
 function noise_std = estimate_std(data,mask)
 tmp = bsxfun(@times,data,mask); tmp = nonzeros(tmp);
 tmp = sort([real(tmp); imag(tmp)]); % separate real/imag for median
-k = ceil(numel(tmp)/10); tmp = tmp(k:end-k+1); % trim 10% off both ends
+k = ceil(numel(tmp)/5); tmp = tmp(k:end-k+1); % trim 20% off both ends
 noise_std = 1.4826 * median(abs(tmp-median(tmp))) * sqrt(2); % robust std
 
 %% make calibration matrix
@@ -264,7 +261,7 @@ nk = opts.dims(4);
 % precompute the circshifts with fast indexing
 if ~isfield(opts,'ix')
     opts.ix = repmat(1:uint32(nx*ny*nc),[1 nk]);
-    opts.ix = reshape(opts.ix,nx,ny,nc,nk);
+    opts.ix = reshape(opts.ix,[nx ny nc nk]);
     for k = 1:nk
         x = opts.kernel.x(k);
         y = opts.kernel.y(k);
@@ -309,14 +306,14 @@ A = A(opts.xi);
 A = reshape(A,nx,ny,nc,[]);
 
 %% show plots of various things (slow)
-function display(W,f,r,ksp,data,iter,norms,mask,opts)
+function display(S,f,r,ksp,data,iter,snorm,tol,mask,opts)
 [nx ny nc] = size(ksp);
 % prefer ims over imagesc
 if exist('ims','file'); imagesc = @(x)ims(x,-0.99); end
 % singular values
-subplot(2,4,[1 5]); plot(W/W(1)); hold on; plot(f,'--'); hold off
+subplot(2,4,[1 5]); plot(S/S(1)); hold on; plot(f,'--'); hold off
 xlim([0 numel(f)]); title(sprintf('rank %i/%i',nnz(f),numel(f)));
-line(xlim,[0 0]+gather(W(nnz(f))/W(1)),'linestyle',':','color','black');
+line(xlim,[0 0]+gather(S(nnz(f))/S(1)),'linestyle',':','color','black');
 legend({'singular vals.','sing. val. filter','noise floor'});
 % residual norm plot
 subplot(2,4,2); [k,~,v] = find(r); plot(k,v); ylabel('r / std');
@@ -334,7 +331,7 @@ if opts.readout==2; xlabel('dim 1'); ylabel('dim 2'); end
 subplot(2,4,[3 7]); tmp = sum(abs(ifft2(ksp)),3);
 if max(tmp(:,1))>max(tmp(:,floor(ny/2)+1)); tmp = fftshift(tmp); end
 imagesc(tmp); xlabel('dim 2'); ylabel('dim 1'); title(sprintf('iter %i',iter));
-% change in norms
-subplot(2,4,[4 8]); g = plotyy(1:iter,norms(2,:),1:iter,norms(1,:),'semilogy','semilogy');
-xlim(g,[0 iter]); xlabel('iters'); title('metrics'); legend({'||Δk||','||A||_*'});
+% change in norm
+subplot(2,4,[4 8]); semilogy(1:iter,snorm); xlim([0 iter]); xlabel('iters');
+title(sprintf('tol %.2e',tol)); grid on; legend('||A||_p','location','northwest');
 drawnow;
